@@ -5,13 +5,12 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
-    healthCheckPath: /health
     envVars:
-      - key: SECRET_KEY
-        generateValue: true
       - key: RESEARCH_USER
         value: researcher
       - key: RESEARCH_PASSWORD
         sync: false
+      - key: SECRET_KEY
+        generateValue: true
       - key: COOKIE_SECURE
         value: "1"

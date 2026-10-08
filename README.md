@@ -1,15 +1,17 @@
 # خوارزمية البحث عن المراد / المعنى العام
 
-هذه مجلد تشغيل تجريبي مرتب للمشروع، جاهز للوضع في مستودع GitHub ثم نشره على Render.
+نسخة إعداد جديدة. لا تُعرض نتائج قرآنية حقيقية قبل إضافة مصدر QAC v0.4 الأصلي.
 
-## مهم
-ملف `data/source_units.jsonl` يحتوي حاليًا بيانات DEMO فقط، وليس corpus موثقًا للقرآن الكريم والسنة الصحيحة. لذلك هذه النسخة لا تدعي نتائج بحث دلالية نهائية.
+ضع الملف الأصلي غير المعدل في:
+data/qac_morphology_0.4.txt
 
-## التشغيل
-- تثبيت المتطلبات من `requirements.txt`
-- ضبط `RESEARCH_USER` و`RESEARCH_PASSWORD` و`SECRET_KEY`
-- تشغيل `gunicorn app:app` في الاستضافة
-- اختبار `/health`
+المصدر الرسمي:
+https://corpus.quran.com/download/
 
-## Render
-يوجد `render.yaml` جاهز، مع كلمة مرور تملأها من إعدادات الخدمة لأن المفتاح `RESEARCH_PASSWORD` سري.
+قواعد المنهج:
+Candidate ≠ Fact
+NotFound ≠ False
+TemporalOrder ≠ Causality
+No effect without comparison
+No provenance ⇒ No evidential status
+Discovery data ≠ independent test data
