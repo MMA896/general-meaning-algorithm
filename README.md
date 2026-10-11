@@ -1,17 +1,13 @@
-# خوارزمية البحث عن المراد / المعنى العام
+# GMA — Corpus Search Engine next
 
-نسخة إعداد جديدة. لا تُعرض نتائج قرآنية حقيقية قبل إضافة مصدر QAC v0.4 الأصلي.
+هذه النسخة تربط واجهة البحث بطبقة فهرسة فعلية لبيانات Quranic Arabic Corpus morphology v0.4.
 
-ضع الملف الأصلي غير المعدل في:
-data/qac_morphology_0.4.txt
+- لا تُعدّل ملف corpus الأصلي.
+- المصدر: Quranic Arabic Corpus morphology v0.4.
+- الرابط المصدر محفوظ في التطبيق.
+- البحث يدعم auto/exact/lemma/root/character.
+- النتائج تتضمن الإحداثيات والسابق واللاحق وlemma/root/POS.
+- النتائج الوصفية لا تُعامل كدليل دلالي.
 
-المصدر الرسمي:
-https://corpus.quran.com/download/
-
-قواعد المنهج:
-Candidate ≠ Fact
-NotFound ≠ False
-TemporalOrder ≠ Causality
-No effect without comparison
-No provenance ⇒ No evidential status
-Discovery data ≠ independent test data
+للتشغيل: `python app.py` أو `gunicorn app:app`.
+عند غياب corpus يحاول التطبيق جلب النسخة الأصلية غير المعدلة من مستودع عام يحوي الملف.
