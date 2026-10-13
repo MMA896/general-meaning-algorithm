@@ -1,13 +1,30 @@
-# GMA — Corpus Search Engine next
+# خوارزمية البحث عن المراد / المعنى العام
 
-هذه النسخة تربط واجهة البحث بطبقة فهرسة فعلية لبيانات Quranic Arabic Corpus morphology v0.4.
+## نطاق هذه الحزمة
+هذه نسخة أولية ذات فحص نصي وصفي محدود. لا تدّعي استخراج دلالات قرآنية أو إثبات علاقات لغوية. لا تعرض نتائج قرآنية موثقة قبل توفير ملف المصدر الأصلي والتحقق من ترخيصه وبنيته ومطابقة سجلاته.
 
-- لا تُعدّل ملف corpus الأصلي.
-- المصدر: Quranic Arabic Corpus morphology v0.4.
-- الرابط المصدر محفوظ في التطبيق.
-- البحث يدعم auto/exact/lemma/root/character.
-- النتائج تتضمن الإحداثيات والسابق واللاحق وlemma/root/POS.
-- النتائج الوصفية لا تُعامل كدليل دلالي.
+## متطلبات التشغيل
+- Python 3.10+
+- تثبيت المتطلبات: `pip install -r requirements.txt`
+- ضبط `RESEARCH_PASSWORD` و`SECRET_KEY` في بيئة التشغيل. لا تستخدم كلمة مرور افتراضية.
+- `RESEARCH_USER` اختياري، وافتراضيه `researcher`.
+- `COOKIE_SECURE=1` مناسب للنشر خلف HTTPS.
 
-للتشغيل: `python app.py` أو `gunicorn app:app`.
-عند غياب corpus يحاول التطبيق جلب النسخة الأصلية غير المعدلة من مستودع عام يحوي الملف.
+## مصدر corpus
+المسار المتوقع في هذه النسخة هو `data/qac_morphology_0.4.txt`. الملف غير مضمن في هذه الحزمة. المصدر المشار إليه في المشروع: https://corpus.quran.com/download/
+لا يُعتبر وجود الملف وحده تحققًا من النتائج؛ يجب فحص تنسيقه وحقوله وتوثيق الإصدار.
+
+## قواعد المنهج
+- Candidate ≠ Fact
+- NotFound ≠ False
+- TemporalOrder ≠ Causality
+- No effect without comparison
+- No provenance ⇒ No evidential status
+- Discovery data ≠ independent test data
+
+## اختبارات
+بعد تثبيت المتطلبات، شغّل: `python -m unittest -v test_app.py`
+افحص صياغة JavaScript باستخدام: `node --check static/app.js`
+
+## حدود النشر
+قاعدة البيانات SQLite تُنشأ بجانب التطبيق. على استضافة لا تضمن قرصًا دائمًا، قد تضيع سجلات التشغيل عند إعادة إنشاء البيئة أو نشر جديد. للاستخدام الموثوق طويل الأمد، انقل السجلات إلى قاعدة بيانات دائمة مثل PostgreSQL مع نسخ احتياطي.
