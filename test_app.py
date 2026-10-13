@@ -20,6 +20,29 @@ class SearchFlowTests(unittest.TestCase):
         application.DB_PATH = self.original_db
         self.tmp.cleanup()
 
+
+    def test_init_migrates_existing_runs_table_without_deleting_rows(self):
+        legacy_path = os.path.join(self.tmp.name, "legacy.db")
+        conn = application.sqlite3.connect(legacy_path)
+        conn.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY, created_at TEXT, query_text TEXT, mode TEXT, status TEXT)")
+        conn.execute("INSERT INTO runs(created_at, query_text, mode, status) VALUES('old-date', 'قديم', 'legacy', 'OLD')")
+        conn.commit()
+        conn.close()
+
+        current_db = application.DB_PATH
+        application.DB_PATH = legacy_path
+        try:
+            application.init()
+            conn = application.sqlite3.connect(legacy_path)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+            row = conn.execute("SELECT query_text, status FROM runs WHERE id=1").fetchone()
+            conn.close()
+            self.assertIn("normalized", columns)
+            self.assertIn("classification", columns)
+            self.assertEqual(row, ("قديم", "OLD"))
+        finally:
+            application.DB_PATH = current_db
+
     def test_health_endpoint_reports_status(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)

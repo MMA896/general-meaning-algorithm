@@ -16,7 +16,60 @@ def close(_=None):
     c=g.pop('db',None)
     if c:c.close()
 def init():
-    c=sqlite3.connect(DB_PATH);c.executescript('''CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY,created_at TEXT,query_text TEXT,normalized TEXT,classification TEXT,status TEXT);CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY,run_id INTEGER,axis TEXT,value TEXT,detail TEXT);CREATE TABLE IF NOT EXISTS discoveries(id INTEGER PRIMARY KEY,run_id INTEGER,kind TEXT,payload TEXT);''');c.commit();c.close()
+    # Create current tables, then migrate older databases without deleting their records.
+    c = sqlite3.connect(DB_PATH)
+    try:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT,
+            query_text TEXT,
+            normalized TEXT,
+            classification TEXT,
+            status TEXT
+        );
+        CREATE TABLE IF NOT EXISTS observations (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER,
+            axis TEXT,
+            value TEXT,
+            detail TEXT
+        );
+        CREATE TABLE IF NOT EXISTS discoveries (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER,
+            kind TEXT,
+            payload TEXT
+        );
+        ''')
+        migrations = {
+            "runs": {
+                "created_at": "TEXT",
+                "query_text": "TEXT",
+                "normalized": "TEXT",
+                "classification": "TEXT",
+                "status": "TEXT",
+            },
+            "observations": {
+                "run_id": "INTEGER",
+                "axis": "TEXT",
+                "value": "TEXT",
+                "detail": "TEXT",
+            },
+            "discoveries": {
+                "run_id": "INTEGER",
+                "kind": "TEXT",
+                "payload": "TEXT",
+            },
+        }
+        for table, columns in migrations.items():
+            existing = {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+            for column, sql_type in columns.items():
+                if column not in existing:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+        c.commit()
+    finally:
+        c.close()
 init()
 def required(f):
     @wraps(f)
