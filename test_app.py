@@ -1,6 +1,8 @@
+import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 TEST_DIR = tempfile.mkdtemp(prefix="gma-tests-")
@@ -8,7 +10,7 @@ os.environ["COOKIE_SECURE"] = "0"
 os.environ["DATABASE_PATH"] = os.path.join(TEST_DIR, "test.sqlite3")
 os.environ["INDEX_LOCK_PATH"] = os.path.join(TEST_DIR, "index.lock")
 os.environ["INDEX_STATUS_PATH"] = os.path.join(TEST_DIR, "index-status.json")
-from app import app, normalize  # noqa: E402
+from app import app, normalize, _recover_stale_import_status  # noqa: E402
 
 
 class SearchAppTests(unittest.TestCase):
@@ -29,6 +31,24 @@ class SearchAppTests(unittest.TestCase):
         self.assertIn("version", r.json)
         self.assertIn("index_ready", r.json)
         self.assertIn("import_state", r.json)
+        self.assertEqual(r.json["version"], "2.1.2")
+
+    def test_stale_starting_status_is_recovered(self):
+        with tempfile.TemporaryDirectory(prefix="gma-stale-") as folder:
+            status_path = os.path.join(folder, "status.json")
+            lock_path = os.path.join(folder, "import.lock")
+            old = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+            with open(status_path, "w", encoding="utf-8") as f:
+                json.dump({"state": "starting", "updated_at": old, "started_at": old}, f)
+            with open(lock_path, "w", encoding="utf-8") as f:
+                f.write(f"{os.getpid()}\n{datetime.now(timezone.utc).timestamp()}\n")
+            with patch("app.IMPORT_STATUS_PATH", status_path), \
+                 patch("app.IMPORT_LOCK_PATH", lock_path), \
+                 patch("app._IMPORT_THREAD", None):
+                status = _recover_stale_import_status()
+            self.assertEqual(status["state"], "idle")
+            self.assertEqual(status["recovered_from"], "starting")
+            self.assertFalse(os.path.exists(lock_path))
 
     def test_api_requires_login(self):
         r = self.client.post("/api/search", json={"query": "نفس"})
