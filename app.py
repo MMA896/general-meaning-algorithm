@@ -1,12 +1,13 @@
-import os, re, sqlite3, secrets, json, urllib.request, hashlib
+import os, re, sqlite3, secrets, json, urllib.request, hashlib, threading, time
 from datetime import datetime, timezone
+from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify, g
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE, "research.db"))
 CORPUS_PATH = os.path.join(BASE, "data", "quranic-corpus-morphology-0.4.txt")
 CORPUS_URL = "https://raw.githubusercontent.com/bnjasim/quranic-corpus/master/quranic-corpus-morphology-0.4.txt"
-VERSION = "2.0.0"
+VERSION = "2.1.1"
 DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -14,6 +15,130 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
                   SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1") == "1")
 USER = os.environ.get("RESEARCH_USER", "researcher")
 PASSWORD = os.environ.get("RESEARCH_PASSWORD", "change-me")
+
+# Shared cross-worker status/lock files prevent multiple Gunicorn workers from
+# downloading and rebuilding the same corpus at the same time.
+IMPORT_LOCK_PATH = os.environ.get("INDEX_LOCK_PATH", os.path.join(BASE, ".index_import.lock"))
+IMPORT_STATUS_PATH = os.environ.get("INDEX_STATUS_PATH", os.path.join(BASE, ".index_import_status.json"))
+_IMPORT_THREAD = None
+_IMPORT_THREAD_GUARD = threading.Lock()
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_import_status():
+    try:
+        with open(IMPORT_STATUS_PATH, "r", encoding="utf-8") as f:
+            status = json.load(f)
+        if isinstance(status, dict):
+            return status
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"state": "idle"}
+
+
+def _write_import_status(state, **details):
+    payload = {"state": state, "updated_at": _now_iso(), **details}
+    try:
+        parent = os.path.dirname(IMPORT_STATUS_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        temp = f"{IMPORT_STATUS_PATH}.{os.getpid()}.tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(temp, IMPORT_STATUS_PATH)
+    except OSError:
+        # Status telemetry must never stop indexing/search itself.
+        pass
+    return payload
+
+
+def _claim_import_lock():
+    parent = os.path.dirname(IMPORT_LOCK_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(IMPORT_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{os.getpid()}\n{time.time()}\n")
+            return True
+        except FileExistsError:
+            try:
+                raw = Path(IMPORT_LOCK_PATH).read_text(encoding="utf-8").splitlines()
+                pid = int(raw[0]) if raw else -1
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except PermissionError:
+                    alive = True
+                except (ProcessLookupError, ValueError, OSError):
+                    alive = False
+                if alive:
+                    return False
+                os.unlink(IMPORT_LOCK_PATH)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                try:
+                    age = time.time() - os.path.getmtime(IMPORT_LOCK_PATH)
+                    if age < 900:
+                        return False
+                    os.unlink(IMPORT_LOCK_PATH)
+                except OSError:
+                    continue
+    return False
+
+
+def _release_import_lock():
+    try:
+        raw = Path(IMPORT_LOCK_PATH).read_text(encoding="utf-8").splitlines()
+        if raw and int(raw[0]) == os.getpid():
+            os.unlink(IMPORT_LOCK_PATH)
+    except (OSError, ValueError):
+        pass
+
+
+def _import_worker(force=False):
+    try:
+        _write_import_status("running", started_at=_now_iso(), message="جارٍ جلب المصدر وفهرسته.")
+        result = import_corpus(force=force)
+        if result.get("ok"):
+            _write_import_status("ready", finished_at=_now_iso(), count=result.get("count", 0),
+                                 result_state=result.get("state", "imported"), error=None)
+        else:
+            _write_import_status("error", finished_at=_now_iso(), error=result.get("error", "فشل الاستيراد"),
+                                 detail=result.get("detail"), result=result)
+    except Exception as exc:
+        _write_import_status("error", finished_at=_now_iso(), error="تعذر تجهيز فهرس المصدر.", detail=str(exc))
+    finally:
+        _release_import_lock()
+
+
+def _start_import_background(force=False):
+    global _IMPORT_THREAD
+    if app.config.get("TESTING"):
+        return {"state": "idle", "message": "وضع الاختبار؛ لم يبدأ الاستيراد."}
+    with _IMPORT_THREAD_GUARD:
+        if _IMPORT_THREAD is not None and _IMPORT_THREAD.is_alive():
+            return {"state": "running", "message": "الفهرسة جارية بالفعل."}
+        if not _claim_import_lock():
+            current = _read_import_status()
+            return {"state": current.get("state", "running"), "message": "الفهرسة جارية بالفعل."}
+        _write_import_status("starting", started_at=_now_iso(), message="سيبدأ تجهيز الفهرس في الخلفية.")
+        thread = threading.Thread(target=_import_worker, args=(force,), daemon=True,
+                                  name="quran-corpus-indexer")
+        _IMPORT_THREAD = thread
+        try:
+            thread.start()
+        except Exception as exc:
+            _release_import_lock()
+            _write_import_status("error", finished_at=_now_iso(), error="تعذر بدء الفهرسة.", detail=str(exc))
+            return {"state": "error", "error": str(exc)}
+    return {"state": "starting", "message": "بدأ تجهيز الفهرس في الخلفية."}
+
 
 def normalize(s):
     s = DIACRITICS.sub("", (s or "")).replace("ـ", "")
@@ -81,45 +206,72 @@ def parse_features(s):
     return d
 
 def import_corpus(force=False):
-    ok,state=ensure_corpus()
-    if not ok: return {"ok":False,"error":"تعذر جلب ملف المصدر القرآني","detail":state}
-    size=str(os.path.getsize(CORPUS_PATH))
-    c=sqlite3.connect(DB_PATH,timeout=60)
-    old=c.execute("SELECT value FROM corpus_meta WHERE key='source_size'").fetchone()
-    count=c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
-    if old and old[0]==size and count and not force:
-        c.close(); return {"ok":True,"state":"already_imported","count":count}
-    c.execute("DELETE FROM units")
-    inserted=0
-    with open(CORPUS_PATH,encoding="utf-8",errors="replace") as f:
-        for line in f:
-            if not line.strip() or line.startswith("#") or "\t" not in line: continue
-            p=line.rstrip("\r\n").split("\t")
-            if len(p)<4: continue
-            loc,surface,tag,features=p[:4]
-            coords=parse_loc(loc)
-            if not coords or not surface: continue
-            surah,verse,word,segment=coords
-            ft=parse_features(features)
-            c.execute("""INSERT OR REPLACE INTO units(surah,verse,word,segment,surface,normalized,tag,features,pos,lemma,root)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                      (surah,verse,word,segment,surface,normalize(surface),tag,features,ft.get("POS"),ft.get("LEM"),ft.get("ROOT")))
-            inserted+=1
-    if inserted<10000:
-        c.rollback(); c.close()
-        return {"ok":False,"error":"ملف المصدر لم ينتج عددًا كافيًا من الوحدات؛ لم يُعتمد الاستيراد","parsed":inserted}
-    c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_size',?)",(size,))
-    c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_name','Quranic Arabic Corpus morphology v0.4')")
-    c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_url',?)",(CORPUS_URL,))
-    c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('imported_at',?)",(datetime.now(timezone.utc).isoformat(),))
-    c.commit(); c.close()
-    return {"ok":True,"state":"imported","count":inserted,"source":CORPUS_URL}
+    ok, state = ensure_corpus()
+    if not ok:
+        return {"ok": False, "error": "تعذر جلب ملف المصدر القرآني", "detail": state}
+    size = str(os.path.getsize(CORPUS_PATH))
+    c = sqlite3.connect(DB_PATH, timeout=60)
+    inserted = 0
+    try:
+        c.execute("PRAGMA busy_timeout=60000")
+        old = c.execute("SELECT value FROM corpus_meta WHERE key='source_size'").fetchone()
+        count = c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
+        if old and old[0] == size and count and not force:
+            return {"ok": True, "state": "already_imported", "count": count}
+
+        # The deletion and insertions are one transaction. If parsing fails,
+        # the previous index remains intact instead of being left half-empty.
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM units")
+        with open(CORPUS_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip() or line.startswith("#") or "\t" not in line:
+                    continue
+                parts = line.rstrip("\r\n").split("\t")
+                if len(parts) < 4:
+                    continue
+                loc, surface, tag, features = parts[:4]
+                coords = parse_loc(loc)
+                if not coords or not surface:
+                    continue
+                surah, verse, word, segment = coords
+                ft = parse_features(features)
+                c.execute(
+                    "INSERT OR REPLACE INTO units(surah,verse,word,segment,surface,normalized,tag,features,pos,lemma,root) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (surah, verse, word, segment, surface, normalize(surface), tag, features,
+                     ft.get("POS"), ft.get("LEM"), ft.get("ROOT")))
+                inserted += 1
+        if inserted < 10000:
+            c.rollback()
+            return {"ok": False, "error": "ملف المصدر لم ينتج عددًا كافيًا من الوحدات؛ لم يُعتمد الاستيراد", "parsed": inserted}
+        c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_size',?)", (size,))
+        c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_name','Quranic Arabic Corpus morphology v0.4')")
+        c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_url',?)", (CORPUS_URL,))
+        c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('imported_at',?)", (_now_iso(),))
+        c.commit()
+        return {"ok": True, "state": "imported", "count": inserted, "source": CORPUS_URL}
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 def ensure_index():
-    c=db()
-    count=c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
-    if count: return {"ok":True,"state":"ready","count":count}
-    return import_corpus()
+    count = db().execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    if count:
+        return {"ok": True, "state": "ready", "count": count}
+    status = _read_import_status()
+    if status.get("state") not in {"starting", "running"}:
+        _start_import_background(force=False)
+        status = _read_import_status()
+    state = status.get("state", "starting")
+    if state == "error":
+        return {"ok": False, "status_code": 503, "code": "INDEX_UNAVAILABLE",
+                "state": state, "error": "تعذر تجهيز فهرس المصدر. أعد المحاولة بعد التحقق من اتصال المصدر.",
+                "detail": status.get("detail") or status.get("error")}
+    return {"ok": False, "status_code": 503, "code": "INDEXING", "state": state,
+            "error": "يجري تجهيز فهرس المصدر لأول مرة في الخلفية. سيبدأ البحث تلقائيًا عند اكتماله.",
+            "detail": status.get("message")}
 
 def authenticated():
     return bool(session.get("authenticated"))
@@ -160,7 +312,10 @@ def neighbors(row):
 
 def analyze(q,mode="auto"):
     state=ensure_index()
-    if not state.get("ok"): return {"ok":False,"status":503,"error":state.get("error"),"detail":state.get("detail")}
+    if not state.get("ok"):
+        return {"ok": False, "status_code": state.get("status_code", 503),
+                "code": state.get("code", "INDEX_UNAVAILABLE"), "state": state.get("state"),
+                "error": state.get("error"), "detail": state.get("detail")}
     rows=search_units(q,mode)
     total=len(rows)
     forms={}; roots={}; lemmas={}; pos={}; prev={}; nxt={}; letters={}
@@ -218,8 +373,8 @@ def login():
         if secrets.compare_digest(request.form.get("username",""),USER) and secrets.compare_digest(request.form.get("password",""),PASSWORD):
             session.clear(); session["authenticated"]=True
             return redirect(url_for("index"))
-        return render_template("login.html",error="اسم المستخدم أو كلمة المرور غير صحيحين.")
-    return render_template("login.html",error=None)
+        return render_template("login.html",error="اسم المستخدم أو كلمة المرور غير صحيحين.", version=VERSION)
+    return render_template("login.html",error=None,version=VERSION)
 
 @app.get("/logout")
 def logout():
@@ -240,17 +395,37 @@ def api_search():
     mode=payload.get("mode","auto")
     if not q: return jsonify({"error":"اكتب كلمة أو عبارة أولًا."}),400
     if mode not in {"auto","exact","lemma","root","character"}: return jsonify({"error":"نمط البحث غير صالح."}),400
-    result=analyze(q,mode)
-    status=result.pop("status_code",None)
-    if not result.get("ok"): return jsonify(result),503
+    result = analyze(q, mode)
+    status_code = int(result.pop("status_code", 200))
+    if not result.get("ok"):
+        return jsonify(result), status_code
     return jsonify(result)
 
 @app.post("/api/admin/import")
 def api_import():
-    denied=login_required_json()
-    if denied: return denied
-    payload=request.get_json(silent=True) or {}
-    return jsonify(import_corpus(force=bool(payload.get("force"))))
+    denied = login_required_json()
+    if denied:
+        return denied
+    payload = request.get_json(silent=True) or {}
+    force = bool(payload.get("force"))
+    count = db().execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    if count and not force:
+        return jsonify({"ok": True, "state": "already_imported", "count": count})
+    status = _start_import_background(force=force)
+    return jsonify({"ok": True, "state": status.get("state", "starting"),
+                    "message": status.get("message", "بدأ تجهيز الفهرس في الخلفية.")}), 202
+
+
+@app.get("/api/admin/import/status")
+def api_import_status():
+    denied = login_required_json()
+    if denied:
+        return denied
+    count = db().execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    status = _read_import_status()
+    if count:
+        status = {**status, "state": "ready", "count": count}
+    return jsonify({**status, "index_ready": bool(count), "indexed_units": count})
 
 @app.get("/api/history")
 def api_history():
@@ -261,12 +436,24 @@ def api_history():
 
 @app.get("/health")
 def health():
-    c=sqlite3.connect(DB_PATH)
-    try: count=c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
-    except sqlite3.Error: count=0
-    c.close()
-    return jsonify({"status":"ok","version":VERSION,"corpus_file_present":os.path.exists(CORPUS_PATH),
-                    "indexed_units":count,"corpus_source":CORPUS_URL})
+    c = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        count = c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    except sqlite3.Error:
+        count = 0
+    finally:
+        c.close()
+    status = _read_import_status()
+    if count:
+        status = {**status, "state": "ready", "count": count}
+    elif not app.config.get("TESTING") and status.get("state") not in {"starting", "running", "error"}:
+        _start_import_background(force=False)
+        status = _read_import_status()
+    return jsonify({"status": "ok", "version": VERSION, "corpus_file_present": os.path.exists(CORPUS_PATH),
+                    "index_ready": bool(count), "indexed_units": count,
+                    "import_state": status.get("state", "idle"),
+                    "import_error": status.get("detail") or status.get("error"),
+                    "corpus_source": CORPUS_URL})
 
 with app.app_context(): init_db()
 if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.environ.get("PORT","5000")))
