@@ -7,7 +7,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE, "research.db"))
 CORPUS_PATH = os.path.join(BASE, "data", "quranic-corpus-morphology-0.4.txt")
 CORPUS_URL = "https://raw.githubusercontent.com/bnjasim/quranic-corpus/master/quranic-corpus-morphology-0.4.txt"
-VERSION = "2.1.2"
+VERSION = "2.1.3"
 DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -219,6 +219,24 @@ def _start_import_background(force=False):
     return {"state": "starting", "message": "بدأ تجهيز الفهرس في الخلفية."}
 
 
+# Quranic Arabic Corpus v0.4 stores FORM, LEM and ROOT in Buckwalter
+# transliteration, not Arabic script. Convert these fields before indexing.
+BUCKWALTER_TO_ARABIC = str.maketrans({
+    "'":"ء", ">":"أ", "&":"ؤ", "<":"إ", "}":"ئ", "A":"ا", "b":"ب",
+    "p":"ة", "t":"ت", "v":"ث", "j":"ج", "H":"ح", "x":"خ", "d":"د",
+    "*":"ذ", "r":"ر", "z":"ز", "s":"س", "$":"ش", "S":"ص", "D":"ض",
+    "T":"ط", "Z":"ظ", "E":"ع", "g":"غ", "_":"ـ", "f":"ف", "q":"ق",
+    "k":"ك", "l":"ل", "m":"م", "n":"ن", "h":"ه", "w":"و", "Y":"ى",
+    "y":"ي", "F":"ً", "N":"ٌ", "K":"ٍ", "a":"َ", "u":"ُ", "i":"ِ",
+    "~":"ّ", "o":"ْ", "^":"ٓ", "#":"ٔ", "`":"ٰ", "{":"ٱ", ":":"ۜ",
+    "@":"۟", '"':"۠", "[":"ۢ", ";":"ۣ", ",":"ۥ", ".":"ۦ", "!":"ۨ",
+    "-":"۪", "+":"۫", "%":"۬", "]":"ۭ",
+})
+PARSER_VERSION = "buckwalter-ar-v1"
+
+def buckwalter_to_arabic(value):
+    return (value or "").translate(BUCKWALTER_TO_ARABIC)
+
 def normalize(s):
     s = DIACRITICS.sub("", (s or "")).replace("ـ", "")
     return re.sub(r"\s+", " ", s.translate(str.maketrans({"أ":"ا","إ":"ا","آ":"ا","ٱ":"ا","ى":"ي"}))).strip()
@@ -294,8 +312,9 @@ def import_corpus(force=False):
     try:
         c.execute("PRAGMA busy_timeout=60000")
         old = c.execute("SELECT value FROM corpus_meta WHERE key='source_size'").fetchone()
+        parser = c.execute("SELECT value FROM corpus_meta WHERE key='parser_version'").fetchone()
         count = c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
-        if old and old[0] == size and count and not force:
+        if old and old[0] == size and parser and parser[0] == PARSER_VERSION and count and not force:
             return {"ok": True, "state": "already_imported", "count": count}
 
         # The deletion and insertions are one transaction. If parsing fails,
@@ -315,10 +334,13 @@ def import_corpus(force=False):
                     continue
                 surah, verse, word, segment = coords
                 ft = parse_features(features)
+                surface_ar = buckwalter_to_arabic(surface)
+                lemma_ar = normalize(buckwalter_to_arabic(ft.get("LEM")))
+                root_ar = normalize(buckwalter_to_arabic(ft.get("ROOT")))
                 c.execute(
                     "INSERT OR REPLACE INTO units(surah,verse,word,segment,surface,normalized,tag,features,pos,lemma,root) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (surah, verse, word, segment, surface, normalize(surface), tag, features,
-                     ft.get("POS"), ft.get("LEM"), ft.get("ROOT")))
+                    (surah, verse, word, segment, surface_ar, normalize(surface_ar), tag, features,
+                     ft.get("POS"), lemma_ar, root_ar))
                 inserted += 1
         if inserted < 10000:
             c.rollback()
@@ -326,6 +348,7 @@ def import_corpus(force=False):
         c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_size',?)", (size,))
         c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_name','Quranic Arabic Corpus morphology v0.4')")
         c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('source_url',?)", (CORPUS_URL,))
+        c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('parser_version',?)", (PARSER_VERSION,))
         c.execute("INSERT OR REPLACE INTO corpus_meta VALUES('imported_at',?)", (_now_iso(),))
         c.commit()
         return {"ok": True, "state": "imported", "count": inserted, "source": CORPUS_URL}
@@ -336,12 +359,15 @@ def import_corpus(force=False):
         c.close()
 
 def ensure_index():
-    count = db().execute("SELECT COUNT(*) FROM units").fetchone()[0]
-    if count:
+    c = db()
+    count = c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    parser = c.execute("SELECT value FROM corpus_meta WHERE key='parser_version'").fetchone()
+    index_current = bool(count and parser and parser[0] == PARSER_VERSION)
+    if index_current:
         return {"ok": True, "state": "ready", "count": count}
     status = _recover_stale_import_status(_read_import_status())
     if status.get("state") not in {"starting", "running"}:
-        _start_import_background(force=False)
+        _start_import_background(force=bool(count))
         status = _read_import_status()
     state = status.get("state", "starting")
     if state == "error":
@@ -349,7 +375,7 @@ def ensure_index():
                 "state": state, "error": "تعذر تجهيز فهرس المصدر. أعد المحاولة بعد التحقق من اتصال المصدر.",
                 "detail": status.get("detail") or status.get("error")}
     return {"ok": False, "status_code": 503, "code": "INDEXING", "state": state,
-            "error": "يجري تجهيز فهرس المصدر لأول مرة في الخلفية. سيبدأ البحث تلقائيًا عند اكتماله.",
+            "error": "يجري تجهيز فهرس المصدر أو تحديث طريقة فهرسته. سيعمل البحث تلقائيًا بعد اكتماله.",
             "detail": status.get("message")}
 
 def authenticated():
@@ -369,15 +395,21 @@ def search_units(q,mode="auto",limit=5000):
         # Search each supplied character in normalized surface; bounded for safety.
         sql="SELECT * FROM units WHERE normalized LIKE ? ORDER BY surah,verse,word,segment LIMIT ?"
         return c.execute(sql,("%"+nq+"%",limit)).fetchall()
-    if mode=="lemma": sql="SELECT * FROM units WHERE lemma=? OR lower(lemma)=lower(?) ORDER BY surah,verse,word,segment LIMIT ?"; args=(q,q,limit)
-    elif mode=="root": sql="SELECT * FROM units WHERE root=? OR lower(root)=lower(?) ORDER BY surah,verse,word,segment LIMIT ?"; args=(q,q,limit)
+    if mode=="lemma":
+        sql="SELECT * FROM units WHERE lemma=? OR normalized=? ORDER BY surah,verse,word,segment LIMIT ?"
+        args=(nq,nq,limit)
+    elif mode=="root":
+        sql="SELECT * FROM units WHERE root=? ORDER BY surah,verse,word,segment LIMIT ?"
+        args=(nq,limit)
     elif mode=="exact": sql="SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment LIMIT ?"; args=(nq,limit)
     else:
         rows=c.execute("SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
         if rows: return rows
-        rows=c.execute("SELECT * FROM units WHERE lemma=? OR lower(lemma)=lower(?) ORDER BY surah,verse,word,segment LIMIT ?",(q,q,limit)).fetchall()
+        rows=c.execute("SELECT * FROM units WHERE lemma=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
         if rows: return rows
-        return c.execute("SELECT * FROM units WHERE root=? OR lower(root)=lower(?) ORDER BY surah,verse,word,segment LIMIT ?",(q,q,limit)).fetchall()
+        rows=c.execute("SELECT * FROM units WHERE root=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
+        if rows: return rows
+        return c.execute("SELECT * FROM units WHERE normalized LIKE ? ORDER BY surah,verse,word,segment LIMIT ?",("%"+nq+"%",limit)).fetchall()
     return c.execute(sql,args).fetchall()
 
 def neighbors(row):
@@ -500,11 +532,18 @@ def api_import_status():
     denied = login_required_json()
     if denied:
         return denied
-    count = db().execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    c = db()
+    count = c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
+    parser = c.execute("SELECT value FROM corpus_meta WHERE key='parser_version'").fetchone()
+    index_current = bool(count and parser and parser[0] == PARSER_VERSION)
     status = _recover_stale_import_status(_read_import_status())
-    if count:
+    if index_current:
         status = {**status, "state": "ready", "count": count}
-    return jsonify({**status, "index_ready": bool(count), "indexed_units": count})
+    elif not app.config.get("TESTING") and status.get("state") not in {"starting", "running"}:
+        _start_import_background(force=bool(count))
+        status = _read_import_status()
+    return jsonify({**status, "index_ready": index_current, "indexed_units": count,
+                    "parser_version": parser[0] if parser else None})
 
 @app.get("/api/history")
 def api_history():
@@ -518,25 +557,27 @@ def health():
     c = sqlite3.connect(DB_PATH, timeout=10)
     try:
         count = c.execute("SELECT COUNT(*) FROM units").fetchone()[0]
+        parser = c.execute("SELECT value FROM corpus_meta WHERE key='parser_version'").fetchone()
     except sqlite3.Error:
-        count = 0
+        count, parser = 0, None
     finally:
         c.close()
+    index_current = bool(count and parser and parser[0] == PARSER_VERSION)
     status = _recover_stale_import_status(_read_import_status())
-    if count:
+    if index_current:
         status = {**status, "state": "ready", "count": count}
-    elif not app.config.get("TESTING") and status.get("state") not in {"starting", "running", "error"}:
-        _start_import_background(force=False)
+    elif not app.config.get("TESTING") and status.get("state") not in {"starting", "running"}:
+        _start_import_background(force=bool(count))
         status = _read_import_status()
     return jsonify({"status": "ok", "version": VERSION, "corpus_file_present": os.path.exists(CORPUS_PATH),
-                    "index_ready": bool(count), "indexed_units": count,
+                    "index_ready": index_current, "indexed_units": count,
                     "import_state": status.get("state", "idle"),
                     "import_error": status.get("detail") or status.get("error"),
                     "import_message": status.get("message"),
                     "import_updated_at": status.get("updated_at"),
                     "import_started_at": status.get("started_at"),
                     "import_recovered_from": status.get("recovered_from"),
-                    "corpus_source": CORPUS_URL})
+                    "corpus_source": CORPUS_URL, "parser_version": parser[0] if parser else None})
 
 with app.app_context(): init_db()
 if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.environ.get("PORT","5000")))
