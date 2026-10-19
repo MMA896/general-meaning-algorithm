@@ -7,7 +7,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE, "research.db"))
 CORPUS_PATH = os.path.join(BASE, "data", "quranic-corpus-morphology-0.4.txt")
 CORPUS_URL = "https://raw.githubusercontent.com/bnjasim/quranic-corpus/master/quranic-corpus-morphology-0.4.txt"
-VERSION = "2.1.4"
+VERSION = "2.1.5"
 DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -415,12 +415,30 @@ def search_units(q,mode="auto",limit=5000):
     return c.execute(sql,args).fetchall()
 
 def neighbors(row):
-    c=db()
-    out={}
-    for label,word in (("previous",row["word"]-1),("next",row["word"]+1)):
-        x=c.execute("SELECT surface,normalized,lemma,root,pos FROM units WHERE surah=? AND verse=? AND word=? ORDER BY segment LIMIT 1",
-                     (row["surah"],row["verse"],word)).fetchone()
-        out[label]=dict(x) if x else None
+    """Return adjacent Quranic words assembled from all morphology segments.
+
+    The corpus stores proclitics/stems as separate rows sharing a word number.
+    Returning only segment 1 made the UI show fragments such as وَ or ٱلْ as
+    though they were complete adjacent words. Join all segments for context.
+    """
+    c = db()
+    out = {}
+    for label, word_no in (("previous", row["word"] - 1), ("next", row["word"] + 1)):
+        parts = c.execute(
+            "SELECT surface,normalized,lemma,root,pos FROM units "
+            "WHERE surah=? AND verse=? AND word=? ORDER BY segment",
+            (row["surah"], row["verse"], word_no),
+        ).fetchall()
+        if not parts:
+            out[label] = None
+            continue
+        item = dict(parts[0])
+        full_surface = "".join(part["surface"] or "" for part in parts)
+        item["surface"] = full_surface
+        item["normalized"] = normalize(full_surface)
+        item["segment_count"] = len(parts)
+        item["pos"] = "+".join(dict.fromkeys(part["pos"] for part in parts if part["pos"])) or None
+        out[label] = item
     return out
 
 def analyze(q,mode="auto"):
@@ -431,13 +449,19 @@ def analyze(q,mode="auto"):
                 "error": state.get("error"), "detail": state.get("detail")}
     rows=search_units(q,mode)
     total=len(rows)
-    forms={}; roots={}; lemmas={}; pos={}; prev={}; nxt={}; letters={}
+    forms={}; roots={}; lemmas={}; pos={}; prev={}; nxt={}; letters={}; letter_units={}
     for r in rows:
         forms[r["surface"]]=forms.get(r["surface"],0)+1
         if r["root"]: roots[r["root"]]=roots.get(r["root"],0)+1
         if r["lemma"]: lemmas[r["lemma"]]=lemmas.get(r["lemma"],0)+1
         if r["pos"]: pos[r["pos"]]=pos.get(r["pos"],0)+1
-        for ch in normalize(r["surface"]).replace(" ",""): letters[ch]=letters.get(ch,0)+1
+        normalized_surface = normalize(r["surface"]).replace(" ", "")
+        # Total character occurrences and number of matched units containing
+        # each character are different statistics; keep both explicitly.
+        for ch in normalized_surface:
+            letters[ch] = letters.get(ch, 0) + 1
+        for ch in set(normalized_surface):
+            letter_units[ch] = letter_units.get(ch, 0) + 1
         n=neighbors(r)
         if n["previous"]: prev[n["previous"]["surface"]]=prev.get(n["previous"]["surface"],0)+1
         if n["next"]: nxt[n["next"]["surface"]]=nxt.get(n["next"]["surface"],0)+1
@@ -458,8 +482,13 @@ def analyze(q,mode="auto"):
       {"kind":"UNIQUE_FORMS","payload":f"عدد الصيغ السطحية المختلفة: {len(forms)}."},
       {"kind":"ROOT_COVERAGE","payload":f"عدد الجذور المسجلة بين النتائج: {len(roots)}."},
       {"kind":"CONTEXT_SAMPLE","payload":f"عُرضت حتى {len(contexts)} مواضع سياقية من أصل {total}."},
+      {"kind":"LETTER_COUNT_METHOD","payload":"تكرار الحروف = مجموع مرات ظهور الحرف داخل الوحدات المطابقة؛ وعدد الوحدات الحاوية للحرف مقياس منفصل."},
       {"kind":"INTERPRETATION_LIMIT","payload":"المخرجات وصفية آلية؛ لا تُعد حكمًا لغويًا نهائيًا أو تفسيرًا شرعيًا."}
     ]
+    analysis_notes = []
+    if total and len(pos) > 1 and not DIACRITICS.search(q):
+        analysis_notes.append("الاستعلام غير مشكول والنتائج تضم أكثر من قسم كلام؛ قد يجمع البحث صيغًا مثل «مِن» و«مَن». افحص النتائج بحسب قسم الكلام والسياق قبل المقارنة الدلالية.")
+        discoveries.append({"kind":"QUERY_AMBIGUITY","payload":analysis_notes[-1]})
     for d in discoveries:
         c.execute("INSERT INTO discoveries(run_id,kind,payload,created_at) VALUES(?,?,?,?)",(rid,d["kind"],d["payload"],now))
     c.commit()
@@ -475,8 +504,9 @@ def analyze(q,mode="auto"):
         "parts_of_speech":sorted(pos.items(),key=lambda x:(-x[1],x[0])),
         "previous_words":sorted(prev.items(),key=lambda x:(-x[1],x[0]))[:25],
         "next_words":sorted(nxt.items(),key=lambda x:(-x[1],x[0]))[:25],
-        "letter_counts":sorted(letters.items(),key=lambda x:(-x[1],x[0]))},
-      "contexts":contexts,"discoveries":discoveries,"method_rules":rules,
+        "letter_counts":sorted(letters.items(),key=lambda x:(-x[1],x[0])),
+        "letter_unit_counts":sorted(letter_units.items(),key=lambda x:(-x[1],x[0]))},
+      "contexts":contexts,"discoveries":discoveries,"analysis_notes":analysis_notes,"method_rules":rules,
       "limits":["هذا المصدر طبقة صرفية/موضعية وليس نص الآيات الكامل؛ لذلك لا يعرض نص الآية كاملًا.","قد تختلف نتائج الجذر/اللمّة بحسب ترميز المصدر.","النتيجة الصفرية لا تثبت الغياب من القرآن؛ فقد يكون النمط أو التطبيع غير مناسب."]}
 
 @app.get("/login")
