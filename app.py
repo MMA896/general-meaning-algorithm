@@ -7,7 +7,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE, "research.db"))
 CORPUS_PATH = os.path.join(BASE, "data", "quranic-corpus-morphology-0.4.txt")
 CORPUS_URL = "https://raw.githubusercontent.com/bnjasim/quranic-corpus/master/quranic-corpus-morphology-0.4.txt"
-VERSION = "2.1.6"
+VERSION = "2.1.7"
 DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -406,44 +406,57 @@ def classify(q, rows):
         return "SOURCE_MATCH"
     return "NO_MATCH"
 
-def search_units(q,mode="auto",limit=5000):
+def search_units(q,mode="auto",limit=5000,with_scope=False):
+    """Search the indexed corpus and optionally report what kind of match was used.
+
+    Auto mode is a priority sequence, not a single linguistic category:
+    vocalized surface -> normalized surface -> lemma -> root -> substring.
+    Returning the scope prevents a report from implying that every auto result
+    came from the same matching rule.
+    """
     c=db()
-    # If the user enters vowel marks, auto mode preserves them instead of
-    # silently merging forms such as مَن and مِن.
     if mode == "auto" and has_arabic_diacritics(q):
         mode = "vocalized"
     nq=normalize(q)
+    scope = mode
     if mode=="vocalized":
         vocalized_query = normalize_vocalized(q)
-        # Use the unvocalized index to get a small candidate set, then compare
-        # the preserved vowel marks in Python. This also ignores Quranic
-        # annotation marks consistently on both the query and stored surface.
         candidates = c.execute(
             "SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment",
             (nq,),
         ).fetchall()
-        return [row for row in candidates
+        rows = [row for row in candidates
                 if normalize_vocalized(row["surface"]) == vocalized_query][:limit]
-    if mode=="character":
-        # Search each supplied character in normalized surface; bounded for safety.
+        scope = "vocalized_surface"
+    elif mode=="character":
         sql="SELECT * FROM units WHERE normalized LIKE ? ORDER BY surah,verse,word,segment LIMIT ?"
-        return c.execute(sql,("%"+nq+"%",limit)).fetchall()
-    if mode=="lemma":
-        sql="SELECT * FROM units WHERE lemma=? OR normalized=? ORDER BY surah,verse,word,segment LIMIT ?"
-        args=(nq,nq,limit)
+        rows = c.execute(sql,("%"+nq+"%",limit)).fetchall()
+        scope = "substring"
+    elif mode=="lemma":
+        rows = c.execute("SELECT * FROM units WHERE lemma=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
+        scope = "lemma"
     elif mode=="root":
-        sql="SELECT * FROM units WHERE root=? ORDER BY surah,verse,word,segment LIMIT ?"
-        args=(nq,limit)
-    elif mode=="exact": sql="SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment LIMIT ?"; args=(nq,limit)
+        rows = c.execute("SELECT * FROM units WHERE root=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
+        scope = "root"
+    elif mode=="exact":
+        rows = c.execute("SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
+        scope = "normalized_surface"
     else:
-        rows=c.execute("SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
-        if rows: return rows
-        rows=c.execute("SELECT * FROM units WHERE lemma=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
-        if rows: return rows
-        rows=c.execute("SELECT * FROM units WHERE root=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
-        if rows: return rows
-        return c.execute("SELECT * FROM units WHERE normalized LIKE ? ORDER BY surah,verse,word,segment LIMIT ?",("%"+nq+"%",limit)).fetchall()
-    return c.execute(sql,args).fetchall()
+        rows = c.execute("SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
+        if rows:
+            scope = "normalized_surface"
+        else:
+            rows = c.execute("SELECT * FROM units WHERE lemma=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
+            if rows:
+                scope = "lemma"
+            else:
+                rows = c.execute("SELECT * FROM units WHERE root=? ORDER BY surah,verse,word,segment LIMIT ?",(nq,limit)).fetchall()
+                if rows:
+                    scope = "root"
+                else:
+                    rows = c.execute("SELECT * FROM units WHERE normalized LIKE ? ORDER BY surah,verse,word,segment LIMIT ?",("%"+nq+"%",limit)).fetchall()
+                    scope = "substring"
+    return (rows, scope) if with_scope else rows
 
 def neighbors(row):
     """Return adjacent Quranic words assembled from all morphology segments.
@@ -479,7 +492,7 @@ def analyze(q,mode="auto"):
                 "code": state.get("code", "INDEX_UNAVAILABLE"), "state": state.get("state"),
                 "error": state.get("error"), "detail": state.get("detail")}
     effective_mode = "vocalized" if mode == "auto" and has_arabic_diacritics(q) else mode
-    rows=search_units(q,mode)
+    rows, match_scope = search_units(q,mode,with_scope=True)
     total=len(rows)
     forms={}; roots={}; lemmas={}; pos={}; prev={}; nxt={}; letters={}; letter_units={}
     for r in rows:
@@ -511,6 +524,7 @@ def analyze(q,mode="auto"):
     rules=["المطابقة اللغوية لا تثبت وحدها علاقة دلالية.","عدم العثور ليس نفيًا.","الترابط الإحصائي لا يثبت السببية.","كل استنتاج يحتاج سياقًا ومقارنة ومصدرًا."]
     discoveries=[
       {"kind":"MATCH_COUNT","payload":f"عدد الوحدات المطابقة في النمط المحدد: {total}."},
+      {"kind":"MATCH_SCOPE","payload":f"نطاق المطابقة الفعلي: {match_scope}. في نمط auto يُعرض أول نوع مطابقة أعاد نتائج، ولا يُعد ذلك حكمًا دلاليًا."},
       {"kind":"UNIQUE_FORMS","payload":f"عدد الصيغ السطحية المختلفة: {len(forms)}."},
       {"kind":"ROOT_COVERAGE","payload":f"عدد الجذور المسجلة بين النتائج: {len(roots)}."},
       {"kind":"CONTEXT_SAMPLE","payload":f"عُرضت حتى {len(contexts)} مواضع سياقية من أصل {total}."},
@@ -531,6 +545,7 @@ def analyze(q,mode="auto"):
     return {"ok":True,"run_id":rid,"created_at":now,"query":q,
       "normalized":normalize_vocalized(q) if effective_mode == "vocalized" else normalize(q),
       "mode":effective_mode,
+      "match_scope":match_scope,
       "classification":classify(q,rows),"status":"MATCHED" if total else "UNRESOLVED",
       "source":{"name":"Quranic Arabic Corpus morphology v0.4","url":CORPUS_URL,
         "imported_at":meta[0] if meta else None,"units":state.get("count") or c.execute("SELECT COUNT(*) FROM units").fetchone()[0]},
