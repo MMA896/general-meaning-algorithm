@@ -7,7 +7,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE, "research.db"))
 CORPUS_PATH = os.path.join(BASE, "data", "quranic-corpus-morphology-0.4.txt")
 CORPUS_URL = "https://raw.githubusercontent.com/bnjasim/quranic-corpus/master/quranic-corpus-morphology-0.4.txt"
-VERSION = "2.1.5"
+VERSION = "2.1.6"
 DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -237,9 +237,24 @@ PARSER_VERSION = "buckwalter-ar-v1"
 def buckwalter_to_arabic(value):
     return (value or "").translate(BUCKWALTER_TO_ARABIC)
 
+def normalize_vocalized(s):
+    """Normalize Arabic spelling while preserving vowel marks for exact vocalized search."""
+    s = (s or "").replace("ـ", "")
+    # Preserve short vowels, tanwin, sukun, shadda and dagger alif.
+    # Quranic annotation signs are not part of ordinary word spelling.
+    s = re.sub(r"[\u06D6-\u06ED]", "", s)
+    return re.sub(r"\s+", " ", s.translate(str.maketrans(
+        {"أ":"ا", "إ":"ا", "آ":"ا", "ٱ":"ا", "ى":"ي"}))).strip()
+
+
 def normalize(s):
     s = DIACRITICS.sub("", (s or "")).replace("ـ", "")
     return re.sub(r"\s+", " ", s.translate(str.maketrans({"أ":"ا","إ":"ا","آ":"ا","ٱ":"ا","ى":"ي"}))).strip()
+
+
+def has_arabic_diacritics(s):
+    """True when the query includes vowel marks that can distinguish word forms."""
+    return bool(re.search(r"[\u064B-\u065F\u0670]", s or ""))
 
 def db():
     if "db" not in g:
@@ -392,7 +407,23 @@ def classify(q, rows):
     return "NO_MATCH"
 
 def search_units(q,mode="auto",limit=5000):
-    c=db(); nq=normalize(q)
+    c=db()
+    # If the user enters vowel marks, auto mode preserves them instead of
+    # silently merging forms such as مَن and مِن.
+    if mode == "auto" and has_arabic_diacritics(q):
+        mode = "vocalized"
+    nq=normalize(q)
+    if mode=="vocalized":
+        vocalized_query = normalize_vocalized(q)
+        # Use the unvocalized index to get a small candidate set, then compare
+        # the preserved vowel marks in Python. This also ignores Quranic
+        # annotation marks consistently on both the query and stored surface.
+        candidates = c.execute(
+            "SELECT * FROM units WHERE normalized=? ORDER BY surah,verse,word,segment",
+            (nq,),
+        ).fetchall()
+        return [row for row in candidates
+                if normalize_vocalized(row["surface"]) == vocalized_query][:limit]
     if mode=="character":
         # Search each supplied character in normalized surface; bounded for safety.
         sql="SELECT * FROM units WHERE normalized LIKE ? ORDER BY surah,verse,word,segment LIMIT ?"
@@ -447,6 +478,7 @@ def analyze(q,mode="auto"):
         return {"ok": False, "status_code": state.get("status_code", 503),
                 "code": state.get("code", "INDEX_UNAVAILABLE"), "state": state.get("state"),
                 "error": state.get("error"), "detail": state.get("detail")}
+    effective_mode = "vocalized" if mode == "auto" and has_arabic_diacritics(q) else mode
     rows=search_units(q,mode)
     total=len(rows)
     forms={}; roots={}; lemmas={}; pos={}; prev={}; nxt={}; letters={}; letter_units={}
@@ -474,7 +506,7 @@ def analyze(q,mode="auto"):
     now=datetime.now(timezone.utc).isoformat()
     c=db()
     cur=c.execute("INSERT INTO runs(created_at,query_text,normalized,mode,status,match_count) VALUES(?,?,?,?,?,?)",
-                  (now,q,normalize(q),mode,"COMPLETED" if total else "NO_MATCH",total))
+                  (now,q,normalize_vocalized(q) if effective_mode == "vocalized" else normalize(q),effective_mode,"COMPLETED" if total else "NO_MATCH",total))
     rid=cur.lastrowid
     rules=["المطابقة اللغوية لا تثبت وحدها علاقة دلالية.","عدم العثور ليس نفيًا.","الترابط الإحصائي لا يثبت السببية.","كل استنتاج يحتاج سياقًا ومقارنة ومصدرًا."]
     discoveries=[
@@ -486,6 +518,9 @@ def analyze(q,mode="auto"):
       {"kind":"INTERPRETATION_LIMIT","payload":"المخرجات وصفية آلية؛ لا تُعد حكمًا لغويًا نهائيًا أو تفسيرًا شرعيًا."}
     ]
     analysis_notes = []
+    if effective_mode == "vocalized":
+        analysis_notes.append("استُخدم البحث المحافظ على التشكيل؛ طوبقت الصيغة المشكولة مع الصيغ السطحية المفهرسة، ولا يعني ذلك وحده حسم المعنى من السياق.")
+        discoveries.append({"kind":"VOCALIZED_SEARCH_METHOD","payload":analysis_notes[-1]})
     if total and len(pos) > 1 and not DIACRITICS.search(q):
         analysis_notes.append("الاستعلام غير مشكول والنتائج تضم أكثر من قسم كلام؛ قد يجمع البحث صيغًا مثل «مِن» و«مَن». افحص النتائج بحسب قسم الكلام والسياق قبل المقارنة الدلالية.")
         discoveries.append({"kind":"QUERY_AMBIGUITY","payload":analysis_notes[-1]})
@@ -493,7 +528,9 @@ def analyze(q,mode="auto"):
         c.execute("INSERT INTO discoveries(run_id,kind,payload,created_at) VALUES(?,?,?,?)",(rid,d["kind"],d["payload"],now))
     c.commit()
     meta=c.execute("SELECT value FROM corpus_meta WHERE key='imported_at'").fetchone()
-    return {"ok":True,"run_id":rid,"created_at":now,"query":q,"normalized":normalize(q),"mode":mode,
+    return {"ok":True,"run_id":rid,"created_at":now,"query":q,
+      "normalized":normalize_vocalized(q) if effective_mode == "vocalized" else normalize(q),
+      "mode":effective_mode,
       "classification":classify(q,rows),"status":"MATCHED" if total else "UNRESOLVED",
       "source":{"name":"Quranic Arabic Corpus morphology v0.4","url":CORPUS_URL,
         "imported_at":meta[0] if meta else None,"units":state.get("count") or c.execute("SELECT COUNT(*) FROM units").fetchone()[0]},
@@ -537,7 +574,7 @@ def api_search():
     q=(payload.get("query") or "").strip()
     mode=payload.get("mode","auto")
     if not q: return jsonify({"error":"اكتب كلمة أو عبارة أولًا."}),400
-    if mode not in {"auto","exact","lemma","root","character"}: return jsonify({"error":"نمط البحث غير صالح."}),400
+    if mode not in {"auto","exact","lemma","root","character","vocalized"}: return jsonify({"error":"نمط البحث غير صالح."}),400
     result = analyze(q, mode)
     status_code = int(result.pop("status_code", 200))
     if not result.get("ok"):
